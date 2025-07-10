@@ -1,0 +1,119 @@
+import matplotlib.pyplot as plt
+import torchvision
+import torch.utils.data
+from torchvision import transforms
+import numpy as np
+import zipfile
+import math
+import sys
+sys.path.append('../../../')
+from model import model
+import os
+
+# from face_model import MobileFacenet
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+BATCH_SIZE = 128
+os.environ['CUDA_VISIBLE_DEVICE'] = '0'
+
+img_transform = transforms.Compose([transforms.Resize((112, 112)),
+                                    transforms.ToTensor(),
+                                    transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))])
+
+
+def write_res(file_path, ans_dict):
+    f = open(file_path, 'r')
+    con = f.readlines()
+    f.close()
+
+    con = np.array(con)
+    # 用来保存文件内数据的字典
+    file_dict = {}
+
+    for i in con:
+        cur = i.strip('\n')
+        # 获取文件中已经存在的key和value，写入字典
+        key = cur.split('=')[0]
+        value = cur.split('=')[1]
+        file_dict[key] = value
+
+    file_dict.update(ans_dict)
+
+    f = open(file_path, 'w')
+    for i in file_dict.keys():
+        key = i
+        value = file_dict[key]
+        f.write(key + '={}'.format(value) + '\n')
+    f.close()
+
+
+def get_succ_loss(net, loader_ori, loader_test):
+    attack_succ = 0
+    test_loss = 0
+    for step, (ori, test) in enumerate(zip(loader_ori, loader_test)):
+        with torch.no_grad():
+            ori_feature = net(ori[0].cuda())
+            test_feature = net(test[0].cuda())
+            cos_ori = ori_feature / torch.norm(ori_feature, dim=1).unsqueeze(1)
+            cos_test = test_feature / torch.norm(test_feature, dim=1).unsqueeze(1)
+
+        score = 0.5 * (torch.sum(cos_ori * cos_test, dim=1) + 1)
+        test_loss += torch.mean(torch.ones_like(score) - score).item()
+        attack_succ += sum((score < 0.8).int()).item()
+
+        # print("第" + str(step) + "批测试样本得分计算完成")
+
+    return 1 - attack_succ / 900, test_loss / (step + 1)
+
+
+if __name__ == '__main__':
+    print('===============================白盒-单步梯度鲁棒性测试===============================')
+    # 模型加载
+    featuresNum = 512
+    net = model.MobileFacenet(featuresNum)  # mobileFace
+
+    ckpt = torch.load("../../../../model/mobileFace-ArcFace.ckpt")
+    net.load_state_dict(ckpt['net_state_dict'])
+    print('----------------------------加载MobileFace模型----------------------------')
+    net = net.cuda()
+    net.eval()
+
+    data_ori = '../../../../dataset'
+    print('加载的数据集为: ', data_ori)
+    case_ori = torchvision.datasets.ImageFolder(data_ori, img_transform)
+    loader_ori = torch.utils.data.DataLoader(case_ori, num_workers=16, batch_size=BATCH_SIZE, shuffle=False,
+                                             drop_last=False)
+
+    fgsm_para = np.linspace(1, 10, 10).astype('double')
+    reco_ac = []
+    reco_loss = []
+    # 读数据集列表 循环数据集
+    test_case_dirs = '../../../../output/limit_data/whitebox_data/fgsm'
+    dir_list = sorted(os.listdir(test_case_dirs), key=lambda str:(str[:4], int(float(str[5:]))))
+    no = 1
+    for dir in dir_list:
+        test_case_name = os.path.join(test_case_dirs, dir)
+        # 使用dataloader读取数据集
+        case_test = torchvision.datasets.ImageFolder(test_case_name, img_transform)
+        loader_test = torch.utils.data.DataLoader(case_test, num_workers=16, batch_size=BATCH_SIZE, shuffle=False,
+                                                  drop_last=False)
+
+        ac, loss = get_succ_loss(net, loader_ori, loader_test)
+        reco_ac.append(ac)
+        reco_loss.append(loss)
+        print("数据集" + str(no) + "准确率%.2f%%\t损失%.4f" % (ac * 100, loss))
+        no = no + 1
+
+    # print(reco_ac)
+    # print(reco_loss)
+    deltaAccRise = -np.mean(np.diff(reco_ac) / np.diff(fgsm_para))
+    deltaLossRise = np.mean(np.diff(reco_loss) / np.diff(fgsm_para))
+    print("准确率下降%.2f%%/扰动增加10%%\t" % (deltaAccRise * 100))
+    print("损失值增大%.4f/扰动增加10%%" % (deltaLossRise))
+
+    # 写入数据
+    fgsm_ac_score = round(((math.pow(100000, 1 - deltaAccRise) - 1) / (100000 - 1)) * 100, 2)
+    fgsm_loss_score = round(100 - deltaLossRise * 100, 2)
+    ans_dict = {"fgsm_ac_score": fgsm_ac_score, "fgsm_loss_score": fgsm_loss_score}
+    write_res("../../../../res/result.txt", ans_dict)
